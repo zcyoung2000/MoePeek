@@ -121,6 +121,9 @@ enum ScreenCaptureOCR {
             request.automaticallyDetectsLanguage = true
             request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US", "ja-JP", "ko-KR"]
             request.usesLanguageCorrection = true
+            // OCR is a one-shot user action, so trading a longer runtime for Vision's
+            // documented lower memory/processing footprint is the right default here.
+            request.preferBackgroundProcessing = true
 
             let handler = VNImageRequestHandler(cgImage: image, options: [:])
             do {
