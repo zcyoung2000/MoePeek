@@ -6,6 +6,7 @@ import os
 /// Do not race a second request against a model load or silently replace CJK with English-only fast OCR.
 public enum AppleOCREngine: Sendable {
     private static let logger = Logger(subsystem: "com.nahida.MoePeek", category: "OCR")
+    private static let recoveryRecognitionRevision = 2
 
     public enum RecognitionError: LocalizedError, Sendable {
         case timeout
@@ -37,9 +38,16 @@ public enum AppleOCREngine: Sendable {
         }
     }()
 
-    public static func recognizeText(in image: CGImage) async throws -> String {
-        logger.info("Starting Apple OCR (\(image.width)x\(image.height) px)")
-        let observations = try await performVisionOCR(on: image)
+    public static func recognizeText(
+        in image: CGImage,
+        recoveryMode: Bool = false
+    ) async throws -> String {
+        logger.info(
+            "Starting Apple OCR (\(image.width)x\(image.height) px), recovery: \(recoveryMode, privacy: .public)"
+        )
+        let observations = recoveryMode
+            ? try await performRecoveryVisionOCR(on: image)
+            : try await performVisionOCR(on: image)
         let text = observations
             .map(\.text)
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -55,10 +63,45 @@ public enum AppleOCREngine: Sendable {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                logger.error("Modern Vision OCR failed: \(String(describing: error), privacy: .public); retrying with legacy accurate recognition")
+                // On macOS 27, falling through to another accurate request can
+                // pay the same ANE compilation cost a second time. The caller
+                // owns the fast recovery policy and can bound this attempt.
+                logger.error("Modern Vision OCR failed: \(String(describing: error), privacy: .public)")
+                throw error
             }
         }
         return try await performLegacyVisionOCR(on: cgImage)
+    }
+
+    /// Compatibility path for the macOS 27 accurate-model regression.
+    /// Revision 2 supports Simplified/Traditional Chinese and Western languages
+    /// without the cold model compile seen in the modern accurate API.
+    private static func performRecoveryVisionOCR(on cgImage: CGImage) async throws -> [RecognizedLine] {
+        let accurateRequest = VNRecognizeTextRequest()
+        accurateRequest.revision = recoveryRecognitionRevision
+        accurateRequest.recognitionLevel = .accurate
+        let accurateSupported = (try? accurateRequest.supportedRecognitionLanguages()) ?? []
+        let accurateLanguages = ["zh-Hans", "zh-Hant", "en-US"].filter(accurateSupported.contains)
+
+        logger.info(
+            "Running OCR recovery with Vision revision 2, languages: \(accurateLanguages, privacy: .public)"
+        )
+        do {
+            let accurateObservations = try await performSingleLegacyVisionOCR(
+                on: cgImage,
+                recognitionLanguages: accurateLanguages,
+                automaticallyDetectsLanguage: false,
+                recognitionLevel: .accurate,
+                revision: recoveryRecognitionRevision
+            )
+            if !accurateObservations.isEmpty { return accurateObservations }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            logger.error("Vision revision 2 recovery failed: \(String(describing: error), privacy: .public)")
+        }
+
+        return []
     }
 
     // MARK: - Legacy API
@@ -80,7 +123,9 @@ public enum AppleOCREngine: Sendable {
     private static func performSingleLegacyVisionOCR(
         on cgImage: CGImage,
         recognitionLanguages: [String] = ["zh-Hans", "zh-Hant", "en-US", "ja-JP", "ko-KR"],
-        automaticallyDetectsLanguage: Bool = true
+        automaticallyDetectsLanguage: Bool = true,
+        recognitionLevel: VNRequestTextRecognitionLevel = .accurate,
+        revision: Int? = nil
     ) async throws -> [RecognizedLine] {
         try await withCheckedThrowingContinuation { continuation in
             let continuationGate = ContinuationGate(continuation: continuation)
@@ -99,7 +144,8 @@ public enum AppleOCREngine: Sendable {
                 )
             }
 
-            request.recognitionLevel = .accurate
+            request.recognitionLevel = recognitionLevel
+            if let revision { request.revision = revision }
             request.recognitionLanguages = recognitionLanguages
             request.usesLanguageCorrection = true
             request.automaticallyDetectsLanguage = automaticallyDetectsLanguage

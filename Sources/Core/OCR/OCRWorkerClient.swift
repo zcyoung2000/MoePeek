@@ -7,6 +7,7 @@ actor OCRWorkerClient {
     static let shared = OCRWorkerClient()
     private static let logger = Logger(subsystem: "com.nahida.MoePeek", category: "OCRWorker")
     private let executableURL: URL
+    private let warmupWaitTimeout: TimeInterval
     private var busy = false
     private var waiters: [(id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
     private var currentInvocation: OCRWorkerInvocation?
@@ -17,30 +18,52 @@ actor OCRWorkerClient {
         let duration: TimeInterval
     }
 
-    init(executableURL: URL = Bundle.main.bundleURL
-        .appendingPathComponent("Contents/MacOS/MoePeekOCRWorker")) {
+    init(
+        executableURL: URL = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/MacOS/MoePeekOCRWorker"),
+        warmupWaitTimeout: TimeInterval = 1.5
+    ) {
         self.executableURL = executableURL
+        self.warmupWaitTimeout = warmupWaitTimeout.isFinite ? max(0, warmupWaitTimeout) : 1.5
     }
 
     static func recognizeText(
         at imageURL: URL,
-        // Cold OS model compilation must finish once before later processes can reuse it.
-        timeout: TimeInterval = 120,
-        warmup: Bool = false
+        timeout: TimeInterval = 8,
+        warmup: Bool = false,
+        recoveryMode: Bool = false
     ) async throws -> String {
-        try await shared.recognizeText(at: imageURL, timeout: timeout, warmup: warmup)
+        try await shared.recognizeText(
+            at: imageURL,
+            timeout: timeout,
+            warmup: warmup,
+            recoveryMode: recoveryMode
+        )
     }
 
     func recognizeText(
         at imageURL: URL,
-        timeout: TimeInterval = 120,
-        warmup: Bool = false
+        timeout: TimeInterval = 8,
+        warmup: Bool = false,
+        recoveryMode: Bool = false
     ) async throws -> String {
         try Task.checkCancellation()
-        // Startup work must never delay a user-initiated capture.
+        // A foreground capture waits briefly for background warmup, then switches
+        // to the compatibility request if warmup still owns the worker slot.
         if warmup, busy { throw CancellationError() }
-        if !warmup, isWarmingUp { currentInvocation?.cancel() }
-        try await acquireSlot()
+        var shouldUseRecoveryMode = recoveryMode
+        if !warmup, isWarmingUp {
+            do {
+                try await acquireSlot(timeout: warmupWaitTimeout)
+            } catch OCRError.timeout {
+                Self.logger.warning("OCR warmup exceeded the foreground wait budget; switching to the compatible recovery request")
+                if isWarmingUp { currentInvocation?.cancel() }
+                try await acquireSlot()
+                shouldUseRecoveryMode = true
+            }
+        } else {
+            try await acquireSlot()
+        }
         defer { releaseSlot() }
         try Task.checkCancellation()
 
@@ -64,6 +87,7 @@ actor OCRWorkerClient {
         }
         let status = try await invocation.run(
             executableURL: executableURL, imageURL: imageURL, warmup: warmup,
+            recoveryMode: shouldUseRecoveryMode,
             timeout: timeout, outputURL: outputURL, diagnosticsURL: diagnosticsURL
         )
         let diagnostics = (try? String(contentsOf: diagnosticsURL, encoding: .utf8))?
@@ -80,12 +104,22 @@ actor OCRWorkerClient {
         }
     }
 
-    private func acquireSlot() async throws {
+    private func acquireSlot(timeout: TimeInterval? = nil) async throws {
         let id = UUID()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 if busy {
                     waiters.append((id, continuation))
+                    if let timeout {
+                        Task {
+                            do {
+                                try await Task.sleep(for: .milliseconds(Int(timeout * 1_000)))
+                                self.timeoutWaiter(id)
+                            } catch {
+                                // The waiter was resumed or cancelled before its deadline.
+                            }
+                        }
+                    }
                 } else {
                     busy = true
                     continuation.resume()
@@ -99,6 +133,11 @@ actor OCRWorkerClient {
     private func cancelWaiter(_ id: UUID) {
         guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
         waiters.remove(at: index).continuation.resume(throwing: CancellationError())
+    }
+
+    private func timeoutWaiter(_ id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        waiters.remove(at: index).continuation.resume(throwing: OCRError.timeout)
     }
 
     private func releaseSlot() {
@@ -122,7 +161,7 @@ private final class OCRWorkerInvocation: @unchecked Sendable {
     private var finished = false
 
     func run(
-        executableURL: URL, imageURL: URL, warmup: Bool,
+        executableURL: URL, imageURL: URL, warmup: Bool, recoveryMode: Bool,
         timeout: TimeInterval, outputURL: URL, diagnosticsURL: URL
     ) async throws -> Int32 {
         try await withTaskCancellationHandler {
@@ -141,10 +180,11 @@ private final class OCRWorkerInvocation: @unchecked Sendable {
                         let child = Process()
                         child.executableURL = executableURL
                         child.arguments = [imageURL.path]
-                        if warmup {
-                            child.environment = ProcessInfo.processInfo.environment.merging(
-                                ["MOEPEEK_OCR_WARMUP": "1"]
-                            ) { _, newValue in newValue }
+                        var environment = ProcessInfo.processInfo.environment
+                        if warmup { environment["MOEPEEK_OCR_WARMUP"] = "1" }
+                        if recoveryMode { environment["MOEPEEK_OCR_RECOVERY_MODE"] = "1" }
+                        if warmup || recoveryMode {
+                            child.environment = environment
                         }
                         // Files avoid pipe-buffer deadlocks on large OCR results or diagnostics.
                         for url in [outputURL, diagnosticsURL] {

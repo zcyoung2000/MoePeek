@@ -37,7 +37,8 @@ enum OCRWorkerMain {
         do {
             // A cold system may compile models for tens of seconds. Let it finish once;
             // the parent enforces the deadline by terminating this isolated process.
-            let text = try await AppleOCREngine.recognizeText(in: cgImage)
+            let recoveryMode = ProcessInfo.processInfo.environment["MOEPEEK_OCR_RECOVERY_MODE"] == "1"
+            let text = try await AppleOCREngine.recognizeText(in: cgImage, recoveryMode: recoveryMode)
             let response = WorkerResponse(text: text, duration: Date().timeIntervalSince(started))
             let encoded = try JSONEncoder().encode(response)
             FileHandle.standardOutput.write(encoded)

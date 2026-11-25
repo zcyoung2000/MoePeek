@@ -97,18 +97,31 @@ struct OCRWorkerClientTests {
             echo $$ > "$1.pid"
             exec /bin/sleep 30
         fi
+        if [ "$MOEPEEK_OCR_RECOVERY_MODE" != 1 ]; then exit 91; fi
         \(WorkerFixture.success)
         """)
         defer { fixture.remove() }
-        let client = OCRWorkerClient(executableURL: fixture.executable)
+        let client = OCRWorkerClient(executableURL: fixture.executable, warmupWaitTimeout: 0.05)
         let warmup = Task { try await client.recognizeText(at: fixture.image, timeout: 20, warmup: true) }
         try await fixture.waitForStart()
+        let started = ContinuousClock.now
         #expect(try await client.recognizeText(at: fixture.image, timeout: 5) == "recognized")
+        #expect(started.duration(to: .now) < .seconds(3))
         do {
             _ = try await warmup.value
             Issue.record("Expected warmup cancellation")
         } catch is CancellationError {}
         try fixture.expectWorkerExited()
+    }
+
+    @Test func recoveryModeIsPassedToTheWorker() async throws {
+        let fixture = try WorkerFixture(script: """
+        [ "$MOEPEEK_OCR_RECOVERY_MODE" = 1 ] || exit 91
+        \(WorkerFixture.success)
+        """)
+        defer { fixture.remove() }
+        let client = OCRWorkerClient(executableURL: fixture.executable)
+        #expect(try await client.recognizeText(at: fixture.image, timeout: 5, recoveryMode: true) == "recognized")
     }
 
     @Test func failuresReleaseTheSlotAndPreserveDiagnostics() async throws {

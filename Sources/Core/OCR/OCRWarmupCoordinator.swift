@@ -9,7 +9,7 @@ import os
 @MainActor
 enum OCRWarmupCoordinator {
     private static let logger = Logger(subsystem: "com.nahida.MoePeek", category: "OCRWarmup")
-    private static let warmupVersion = 2
+    private static let warmupVersion = 3
     private static var warmupTask: Task<Void, Never>?
 
     private static var warmupStateKey: String {
@@ -28,7 +28,21 @@ enum OCRWarmupCoordinator {
                 let started = Date()
                 let url = try writeWarmupImage()
                 defer { try? FileManager.default.removeItem(at: url) }
-                _ = try await OCRWorkerClient.recognizeText(at: url, warmup: true)
+                // Accurate Vision may compile the ANE model for tens of seconds
+                // on macOS 27. Warmup is background work, so let it finish and
+                // populate the system cache before the first user capture.
+                // A successful process exit alone does not mean the model cache
+                // was exercised: Vision can return an empty observation list.
+                // Retry on a later launch rather than suppressing warmup for this boot.
+                let text = try await OCRWorkerClient.recognizeText(
+                    at: url,
+                    timeout: 120,
+                    warmup: true
+                )
+                guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    logger.warning("OCR warmup returned no text; it will retry on the next launch")
+                    return
+                }
                 defaults.set(true, forKey: key)
                 cleanupOldWarmupKeys(currentKey: key)
                 logger.info("OCR warmup completed in \(Date().timeIntervalSince(started), privacy: .public) seconds")

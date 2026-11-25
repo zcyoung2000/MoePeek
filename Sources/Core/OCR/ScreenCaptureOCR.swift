@@ -1,6 +1,11 @@
 import Foundation
+import os
 
 enum ScreenCaptureOCR {
+    private static let logger = Logger(subsystem: "com.nahida.MoePeek", category: "OCRCapture")
+    private static let accurateTimeout: TimeInterval = 8
+    private static let recoveryTimeout: TimeInterval = 8
+
     /// Launch interactive screen capture, OCR the captured image, and return recognized text.
     static func captureAndRecognize() async throws -> String {
         // Generate a unique temp file path to avoid concurrency conflicts
@@ -45,11 +50,56 @@ enum ScreenCaptureOCR {
             throw OCRError.captureCancelled
         }
 
-        let text = try await OCRWorkerClient.recognizeText(at: tmpURL)
+        return try await recognize(
+            accurate: {
+                try await OCRWorkerClient.recognizeText(
+                    at: tmpURL,
+                    timeout: accurateTimeout
+                )
+            },
+            recovery: {
+                try await recoverText(at: tmpURL)
+            }
+        )
+    }
+
+    static func recognize(
+        accurate: () async throws -> String,
+        recovery: () async throws -> String
+    ) async throws -> String {
+        let text: String
+        do {
+            text = try await accurate()
+        } catch OCRError.captureCancelled {
+            throw OCRError.captureCancelled
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            logger.warning("Accurate OCR failed or timed out; trying compatibility OCR: \(String(describing: error), privacy: .public)")
+            return try await nonEmptyRecovery(recovery)
+        }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return try await nonEmptyRecovery(recovery)
+        }
+        return text
+    }
+
+    private static func nonEmptyRecovery(
+        _ recovery: () async throws -> String
+    ) async throws -> String {
+        let text = try await recovery()
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw OCRError.noTextRecognized
         }
         return text
+    }
+
+    private static func recoverText(at imageURL: URL) async throws -> String {
+        try await OCRWorkerClient.recognizeText(
+            at: imageURL,
+            timeout: recoveryTimeout,
+            recoveryMode: true
+        )
     }
 }
 
