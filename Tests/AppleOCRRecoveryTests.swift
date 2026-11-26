@@ -7,7 +7,7 @@ import Testing
 
 @Suite(.timeLimit(.minutes(2)))
 struct AppleOCRRecoveryTests {
-    @Test func revisionTwoRecoveryRecognizesEnglishAndChineseWithoutTheAccurateDefaultModel() async throws {
+    @Test func cpuPinnedRevisionTwoRecoveryRecognizesEnglishAndChinese() async throws {
         let image = try makeMixedLanguageImage()
         let imageURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("moepeek-ocr-recovery-test-\(UUID().uuidString).png")
@@ -25,15 +25,15 @@ struct AppleOCRRecoveryTests {
 
         let workerURL = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/MoePeekOCRWorker")
         let client = OCRWorkerClient(executableURL: workerURL)
-        let text = try await client.recognizeText(at: imageURL, timeout: 8, recoveryMode: true)
+        let text = try await client.recognizeText(at: imageURL, timeout: 12, recoveryMode: true)
 
         #expect(text.contains("MoePeek OCR 123"))
         #expect(text.contains("文字识别"))
     }
 
     private func makeMixedLanguageImage() throws -> CGImage {
-        let width = 1200
-        let height = 260
+        let width = 530
+        let height = 112
         guard let context = CGContext(
             data: nil,
             width: width,
@@ -50,7 +50,7 @@ struct AppleOCRRecoveryTests {
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
         let attributes: [NSAttributedString.Key: Any] = [
             NSAttributedString.Key(kCTFontAttributeName as String):
-                CTFontCreateWithName("PingFangSC-Regular" as CFString, 48, nil),
+                CTFontCreateWithName("PingFangSC-Regular" as CFString, 22, nil),
             NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: 0, alpha: 1),
         ]
 
@@ -58,7 +58,7 @@ struct AppleOCRRecoveryTests {
             let line = CTLineCreateWithAttributedString(
                 NSAttributedString(string: text, attributes: attributes)
             )
-            context.textPosition = CGPoint(x: 28, y: 190 - index * 90)
+            context.textPosition = CGPoint(x: 28, y: 78 - index * 42)
             CTLineDraw(line, context)
         }
 

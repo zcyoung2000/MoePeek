@@ -85,11 +85,22 @@ actor OCRWorkerClient {
             currentInvocation = nil
             isWarmingUp = false
         }
-        let status = try await invocation.run(
-            executableURL: executableURL, imageURL: imageURL, warmup: warmup,
-            recoveryMode: shouldUseRecoveryMode,
-            timeout: timeout, outputURL: outputURL, diagnosticsURL: diagnosticsURL
-        )
+        let status: Int32
+        do {
+            status = try await invocation.run(
+                executableURL: executableURL, imageURL: imageURL, warmup: warmup,
+                recoveryMode: shouldUseRecoveryMode,
+                timeout: timeout, outputURL: outputURL, diagnosticsURL: diagnosticsURL
+            )
+        } catch OCRError.timeout {
+            let phase = warmup ? "warmup" : shouldUseRecoveryMode ? "recovery" : "foreground"
+            let diagnostics = (try? String(contentsOf: diagnosticsURL, encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            Self.logger.error(
+                "OCR \(phase, privacy: .public) worker timed out after \(timeout, privacy: .public) seconds; helper diagnostics: \(diagnostics.isEmpty ? "none" : diagnostics, privacy: .public)"
+            )
+            throw OCRError.timeout
+        }
         let diagnostics = (try? String(contentsOf: diagnosticsURL, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard status == 0 else {

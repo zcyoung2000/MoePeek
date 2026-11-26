@@ -4,7 +4,10 @@ import os
 enum ScreenCaptureOCR {
     private static let logger = Logger(subsystem: "com.nahida.MoePeek", category: "OCRCapture")
     private static let accurateTimeout: TimeInterval = 8
-    private static let recoveryTimeout: TimeInterval = 8
+    // CPU Vision initialization is ANE-independent but can still take about
+    // ten seconds on a cold process. Keep the normal capture deadline short;
+    // give the isolated compatibility helper enough time to initialize once.
+    private static let recoveryTimeout: TimeInterval = 12
 
     /// Launch interactive screen capture, OCR the captured image, and return recognized text.
     static func captureAndRecognize() async throws -> String {
@@ -89,17 +92,27 @@ enum ScreenCaptureOCR {
     ) async throws -> String {
         let text = try await recovery()
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            logger.error("OCR recovery returned no recognized text")
             throw OCRError.noTextRecognized
         }
         return text
     }
 
     private static func recoverText(at imageURL: URL) async throws -> String {
-        try await OCRWorkerClient.recognizeText(
-            at: imageURL,
-            timeout: recoveryTimeout,
-            recoveryMode: true
-        )
+        let started = Date()
+        logger.info("Starting CPU-compatible OCR recovery")
+        do {
+            let text = try await OCRWorkerClient.recognizeText(
+                at: imageURL,
+                timeout: recoveryTimeout,
+                recoveryMode: true
+            )
+            logger.info("CPU-compatible OCR recovery completed in \(Date().timeIntervalSince(started), privacy: .public) seconds; result empty: \(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, privacy: .public)")
+            return text
+        } catch {
+            logger.error("CPU-compatible OCR recovery failed after \(Date().timeIntervalSince(started), privacy: .public) seconds: \(String(describing: error), privacy: .public)")
+            throw error
+        }
     }
 }
 

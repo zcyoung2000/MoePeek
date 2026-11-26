@@ -1,4 +1,5 @@
 import Foundation
+import CoreML
 import os
 @preconcurrency import Vision
 
@@ -10,11 +11,13 @@ public enum AppleOCREngine: Sendable {
 
     public enum RecognitionError: LocalizedError, Sendable {
         case timeout
+        case cpuRecoveryUnavailable
         case failed(any Error)
 
         public var errorDescription: String? {
             switch self {
             case .timeout: String(localized: "Text recognition timed out")
+            case .cpuRecoveryUnavailable: String(localized: "CPU OCR recovery is unavailable")
             case .failed(let error):
                 String(localized: "Vision recognition failed: \(error.localizedDescription)")
             }
@@ -74,8 +77,8 @@ public enum AppleOCREngine: Sendable {
     }
 
     /// Compatibility path for the macOS 27 accurate-model regression.
-    /// Revision 2 supports Simplified/Traditional Chinese and Western languages
-    /// without the cold model compile seen in the modern accurate API.
+    /// Revision 2 supports Chinese and Western languages and is explicitly pinned
+    /// to CPU so a cold ANE model compile cannot stall the recovery request too.
     private static func performRecoveryVisionOCR(on cgImage: CGImage) async throws -> [RecognizedLine] {
         let accurateRequest = VNRecognizeTextRequest()
         accurateRequest.revision = recoveryRecognitionRevision
@@ -92,15 +95,16 @@ public enum AppleOCREngine: Sendable {
                 recognitionLanguages: accurateLanguages,
                 automaticallyDetectsLanguage: false,
                 recognitionLevel: .accurate,
-                revision: recoveryRecognitionRevision
+                revision: recoveryRecognitionRevision,
+                computeOnCPU: true
             )
             if !accurateObservations.isEmpty { return accurateObservations }
         } catch is CancellationError {
             throw CancellationError()
         } catch {
             logger.error("Vision revision 2 recovery failed: \(String(describing: error), privacy: .public)")
+            throw error
         }
-
         return []
     }
 
@@ -125,7 +129,8 @@ public enum AppleOCREngine: Sendable {
         recognitionLanguages: [String] = ["zh-Hans", "zh-Hant", "en-US", "ja-JP", "ko-KR"],
         automaticallyDetectsLanguage: Bool = true,
         recognitionLevel: VNRequestTextRecognitionLevel = .accurate,
-        revision: Int? = nil
+        revision: Int? = nil,
+        computeOnCPU: Bool = false
     ) async throws -> [RecognizedLine] {
         try await withCheckedThrowingContinuation { continuation in
             let continuationGate = ContinuationGate(continuation: continuation)
@@ -149,6 +154,24 @@ public enum AppleOCREngine: Sendable {
             request.recognitionLanguages = recognitionLanguages
             request.usesLanguageCorrection = true
             request.automaticallyDetectsLanguage = automaticallyDetectsLanguage
+
+            if computeOnCPU {
+                do {
+                    let availableDevices = try request.supportedComputeStageDevices[.main] ?? []
+                    guard let cpuDevice = availableDevices.first(where: { device in
+                        if case .cpu = device { return true }
+                        return false
+                    }) else {
+                        continuationGate.resume(throwing: RecognitionError.cpuRecoveryUnavailable)
+                        return
+                    }
+                    request.setComputeDevice(cpuDevice, for: .main)
+                    logger.info("Pinned compatibility OCR to CPU to bypass ANE compilation")
+                } catch {
+                    continuationGate.resume(throwing: RecognitionError.failed(error))
+                    return
+                }
+            }
 
             let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
             DispatchQueue.global(qos: .userInitiated).async {
