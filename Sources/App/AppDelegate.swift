@@ -48,6 +48,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // .regular from a previous session, ignoring LSUIElement on relaunch.
         NSApp.setActivationPolicy(Defaults[.showInDock] ? .regular : .accessory)
 
+        // Keep Vision's initialized models in this long-lived process before the
+        // user invokes either OCR shortcut.
+        OCRWarmupCoordinator.warmUpIfNeeded()
         setupShortcuts()
         setupSelectionMonitor()
 
@@ -65,9 +68,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if !permissionManager.allPermissionsGranted {
             permissionManager.startPolling()
-        }
-        if Defaults[.ocrWarmupEnabled] {
-            OCRWarmupCoordinator.warmUpIfNeeded()
         }
     }
 

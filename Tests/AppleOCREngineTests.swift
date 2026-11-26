@@ -1,34 +1,27 @@
 import CoreGraphics
 import CoreText
 import Foundation
-import ImageIO
 import Testing
 @testable import MoePeek
 
-@Suite(.timeLimit(.minutes(2)))
-struct AppleOCRRecoveryTests {
-    @Test func cpuPinnedRevisionTwoRecoveryRecognizesEnglishAndChinese() async throws {
-        let image = try makeMixedLanguageImage()
-        let imageURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("moepeek-ocr-recovery-test-\(UUID().uuidString).png")
-        defer { try? FileManager.default.removeItem(at: imageURL) }
-        guard let destination = CGImageDestinationCreateWithURL(
-            imageURL as CFURL,
-            "public.png" as CFString,
-            1,
-            nil
-        ) else {
-            throw CocoaError(.fileWriteUnknown)
+@Suite(.timeLimit(.minutes(3)))
+struct AppleOCREngineTests {
+    @Test @MainActor func accurateVisionReusesTheWarmedProcess() async throws {
+        OCRWarmupCoordinator.warmUpIfNeeded()
+        let deadline = ContinuousClock.now + .seconds(150)
+        while !OCRWarmupCoordinator.isReady, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(100))
         }
-        CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination) else { throw CocoaError(.fileWriteUnknown) }
+        #expect(OCRWarmupCoordinator.isReady)
 
-        let workerURL = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/MoePeekOCRWorker")
-        let client = OCRWorkerClient(executableURL: workerURL)
-        let text = try await client.recognizeText(at: imageURL, timeout: 20, recoveryMode: true)
+        let image = try makeMixedLanguageImage()
+        let text = try await AppleOCREngine.recognizeText(in: image, timeout: 20)
 
         #expect(text.contains("MoePeek OCR 123"))
         #expect(text.contains("文字识别"))
+
+        let repeatedText = try await AppleOCREngine.recognizeText(in: image, timeout: 20)
+        #expect(repeatedText.contains("MoePeek OCR 123"))
     }
 
     private func makeMixedLanguageImage() throws -> CGImage {

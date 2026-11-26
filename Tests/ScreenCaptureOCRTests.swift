@@ -3,55 +3,41 @@ import Testing
 @testable import MoePeek
 
 struct ScreenCaptureOCRTests {
-    @Test func accurateTextReturnsWithoutRecovery() async throws {
-        let text = try await ScreenCaptureOCR.recognize(
-            accurate: { "recognized accurately" },
-            recovery: { throw OCRError.workerUnavailable }
-        )
+    private enum TestFailure: Error { case expected }
+
+    @Test func accurateTextReturnsDirectly() async throws {
+        let text = try await ScreenCaptureOCR.recognize(accurate: { "recognized accurately" })
         #expect(text == "recognized accurately")
     }
 
-    @Test func accurateFailureUsesRecovery() async throws {
-        let text = try await ScreenCaptureOCR.recognize(
-            accurate: { throw OCRError.timeout },
-            recovery: { "recovered" }
-        )
-        #expect(text == "recovered")
-    }
-
-    @Test func emptyAccurateResultUsesRecovery() async throws {
-        let text = try await ScreenCaptureOCR.recognize(
-            accurate: { " \n " },
-            recovery: { "recovered" }
-        )
-        #expect(text == "recovered")
-    }
-
-    @Test func recoveryMustReturnNonemptyText() async throws {
+    @Test func accurateFailureIsPropagatedWithoutRetry() async throws {
+        var attempts = 0
         do {
-            _ = try await ScreenCaptureOCR.recognize(
-                accurate: { "" },
-                recovery: { " \n " }
-            )
-            Issue.record("Expected an empty recovery result to fail")
+            _ = try await ScreenCaptureOCR.recognize {
+                attempts += 1
+                throw TestFailure.expected
+            }
+            Issue.record("Expected OCR failure")
+        } catch TestFailure.expected {}
+        #expect(attempts == 1)
+    }
+
+    @Test func emptyResultIsReportedWithoutRetry() async throws {
+        var attempts = 0
+        do {
+            _ = try await ScreenCaptureOCR.recognize {
+                attempts += 1
+                return " \n "
+            }
+            Issue.record("Expected an empty OCR result to fail")
         } catch OCRError.noTextRecognized {}
+        #expect(attempts == 1)
     }
 
-    @Test(arguments: [false, true])
-    func cancellationDoesNotStartRecovery(captureCancellation: Bool) async throws {
+    @Test func cancellationIsPropagated() async throws {
         do {
-            _ = try await ScreenCaptureOCR.recognize(
-                accurate: {
-                    if captureCancellation { throw OCRError.captureCancelled }
-                    throw CancellationError()
-                },
-                recovery: { throw OCRError.workerUnavailable }
-            )
+            _ = try await ScreenCaptureOCR.recognize { throw CancellationError() }
             Issue.record("Expected cancellation")
-        } catch is CancellationError {
-            #expect(!captureCancellation)
-        } catch OCRError.captureCancelled {
-            #expect(captureCancellation)
-        }
+        } catch is CancellationError {}
     }
 }
