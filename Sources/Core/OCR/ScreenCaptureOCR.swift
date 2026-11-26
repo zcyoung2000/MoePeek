@@ -4,10 +4,11 @@ import os
 enum ScreenCaptureOCR {
     private static let logger = Logger(subsystem: "com.nahida.MoePeek", category: "OCRCapture")
     private static let accurateTimeout: TimeInterval = 8
-    // CPU Vision initialization is ANE-independent but can still take about
-    // ten seconds on a cold process. Keep the normal capture deadline short;
-    // give the isolated compatibility helper enough time to initialize once.
-    private static let recoveryTimeout: TimeInterval = 12
+    // CPU Vision initialization is ANE-independent but can still take more
+    // than ten seconds on a cold process, including post-processing setup.
+    // Keep the normal capture deadline short and give the isolated recovery
+    // helper enough time to initialize once.
+    private static let recoveryTimeout: TimeInterval = 20
 
     /// Launch interactive screen capture, OCR the captured image, and return recognized text.
     static func captureAndRecognize() async throws -> String {

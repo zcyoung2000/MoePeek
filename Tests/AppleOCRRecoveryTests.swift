@@ -25,7 +25,7 @@ struct AppleOCRRecoveryTests {
 
         let workerURL = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/MoePeekOCRWorker")
         let client = OCRWorkerClient(executableURL: workerURL)
-        let text = try await client.recognizeText(at: imageURL, timeout: 12, recoveryMode: true)
+        let text = try await client.recognizeText(at: imageURL, timeout: 20, recoveryMode: true)
 
         #expect(text.contains("MoePeek OCR 123"))
         #expect(text.contains("文字识别"))

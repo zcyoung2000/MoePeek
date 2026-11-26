@@ -157,16 +157,21 @@ public enum AppleOCREngine: Sendable {
 
             if computeOnCPU {
                 do {
-                    let availableDevices = try request.supportedComputeStageDevices[.main] ?? []
-                    guard let cpuDevice = availableDevices.first(where: { device in
-                        if case .cpu = device { return true }
-                        return false
-                    }) else {
+                    let supportedStages = try request.supportedComputeStageDevices
+                    let cpuDevicesByStage = supportedStages.compactMapValues { devices in
+                        devices.first { device in
+                            if case .cpu = device { return true }
+                            return false
+                        }
+                    }
+                    guard cpuDevicesByStage.count == supportedStages.count else {
                         continuationGate.resume(throwing: RecognitionError.cpuRecoveryUnavailable)
                         return
                     }
-                    request.setComputeDevice(cpuDevice, for: .main)
-                    logger.info("Pinned compatibility OCR to CPU to bypass ANE compilation")
+                    for (stage, cpuDevice) in cpuDevicesByStage {
+                        request.setComputeDevice(cpuDevice, for: stage)
+                    }
+                    logger.info("Pinned compatibility OCR compute stages to CPU to bypass ANE compilation")
                 } catch {
                     continuationGate.resume(throwing: RecognitionError.failed(error))
                     return
