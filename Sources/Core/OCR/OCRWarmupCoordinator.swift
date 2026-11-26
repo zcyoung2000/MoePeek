@@ -41,7 +41,7 @@ enum OCRWarmupCoordinator {
 
     private static func makeWarmupImage() throws -> CGImage {
         let width = 640
-        let height = 120
+        let height = 240
         guard let context = CGContext(
             data: nil,
             width: width,
@@ -56,18 +56,19 @@ enum OCRWarmupCoordinator {
 
         context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        // Exercise real scripts so warmup also initializes non-Latin recognizers.
+        // Keep scripts on separate lines so automatic detection exercises each
+        // recognizer instead of classifying a mixed CJK line as just one script.
         let attributes: [NSAttributedString.Key: Any] = [
             NSAttributedString.Key(kCTFontAttributeName as String):
                 CTFontCreateWithName("Helvetica" as CFString, 28, nil),
             NSAttributedString.Key(kCTForegroundColorAttributeName as String):
                 CGColor(gray: 0, alpha: 1),
         ]
-        for (index, text) in ["MoePeek OCR 123", "文字识别 日本語 한국어"].enumerated() {
+        for (index, text) in ["MoePeek OCR 123", "文字识别测试", "日本語の認識", "한국어 인식"].enumerated() {
             let line = CTLineCreateWithAttributedString(
                 NSAttributedString(string: text, attributes: attributes)
             )
-            context.textPosition = CGPoint(x: 12, y: 76 - index * 48)
+            context.textPosition = CGPoint(x: 12, y: height - 44 - index * 48)
             CTLineDraw(line, context)
         }
 

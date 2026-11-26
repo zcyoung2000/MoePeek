@@ -1,11 +1,13 @@
 import Foundation
+import CoreML
 import os
 @preconcurrency import Vision
 
 /// Accurate OCR hosted in MoePeek's long-lived process so Vision can reuse its initialized models.
 public enum AppleOCREngine: Sendable {
-    private static let logger = Logger(subsystem: "com.nahida.MoePeek", category: "OCR")
+    fileprivate static let logger = Logger(subsystem: "com.nahida.MoePeek", category: "OCR")
     private static let recognitionSlot = RecognitionSlot()
+    private static let recognizer = VisionTextRecognizer()
 
     public enum RecognitionError: LocalizedError, Sendable {
         case timeout
@@ -58,58 +60,60 @@ public enum AppleOCREngine: Sendable {
     }
 
     private static func performVisionOCR(on cgImage: CGImage) async throws -> [RecognizedLine] {
-        return try await performLegacyVisionOCR(on: cgImage)
+        try await recognizer.recognize(cgImage)
     }
+}
 
-    // MARK: - Legacy API
+private struct RecognizedLine: Sendable {
+    let text: String
+}
 
-    private static func performLegacyVisionOCR(on cgImage: CGImage) async throws -> [RecognizedLine] {
-        try await performSingleLegacyVisionOCR(on: cgImage)
-    }
+/// The queue owns the request and the processing session that keeps its models alive.
+private final class VisionTextRecognizer: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.nahida.MoePeek.OCR", qos: .userInitiated)
+    private var handler = VNSequenceRequestHandler()
+    private var request: VNRecognizeTextRequest?
 
-    private static func performSingleLegacyVisionOCR(
-        on cgImage: CGImage,
-        recognitionLanguages: [String] = ["zh-Hans", "zh-Hant", "en-US", "ja-JP", "ko-KR"],
-        automaticallyDetectsLanguage: Bool = true,
-        recognitionLevel: VNRequestTextRecognitionLevel = .accurate
-    ) async throws -> [RecognizedLine] {
+    func recognize(_ image: CGImage) async throws -> [RecognizedLine] {
         let requestController = VisionRequestController()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                let continuationGate = ContinuationGate(continuation: continuation)
-                let request = VNRecognizeTextRequest { request, error in
-                    if let error {
-                        continuationGate.resume(throwing: RecognitionError.failed(error))
+                queue.async {
+                    let request = self.request ?? Self.makeRequest()
+                    self.request = request
+                    if requestController.install(request) {
+                        self.request = nil
+                        continuation.resume(throwing: CancellationError())
                         return
                     }
 
-                    let observations = (request.results as? [VNRecognizedTextObservation]) ?? []
-                    continuationGate.resume(
-                        returning: observations.compactMap { observation in
+                    do {
+                        try self.handler.perform([request], on: image)
+
+                        // A completion callback can run before perform returns.
+                        // Keep the recognition slot until Vision has fully unwound.
+                        // Detach cancellation before this request can be reused.
+                        guard !requestController.finish() else {
+                            self.request = nil
+                            continuation.resume(throwing: CancellationError())
+                            return
+                        }
+                        let lines: [RecognizedLine] = (request.results ?? []).compactMap { observation in
                             guard let candidate = observation.topCandidates(1).first else { return nil }
                             return RecognizedLine(text: candidate.string)
                         }
-                    )
-                }
-
-                request.recognitionLevel = recognitionLevel
-                request.revision = 2
-                request.recognitionLanguages = recognitionLanguages
-                request.usesLanguageCorrection = true
-                request.automaticallyDetectsLanguage = automaticallyDetectsLanguage
-                request.preferBackgroundProcessing = true
-
-                if requestController.install(request) {
-                    continuationGate.resume(throwing: CancellationError())
-                    return
-                }
-
-                let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-                DispatchQueue.global(qos: .userInitiated).async {
-                    do {
-                        try handler.perform([request])
+                        continuation.resume(returning: lines)
                     } catch {
-                        continuationGate.resume(throwing: RecognitionError.failed(error))
+                        // Cancelled and failed requests must not become the next
+                        // capture's warmed request.
+                        self.request = nil
+                        let wasCancelled = requestController.finish()
+                        if !wasCancelled {
+                            self.handler = VNSequenceRequestHandler()
+                        }
+                        continuation.resume(throwing: wasCancelled
+                            ? CancellationError()
+                            : AppleOCREngine.RecognitionError.failed(error))
                     }
                 }
             }
@@ -118,35 +122,39 @@ public enum AppleOCREngine: Sendable {
         }
     }
 
-}
-
-private struct RecognizedLine: Sendable {
-    let text: String
-}
-
-/// Race-safe one-shot continuation wrapper for the legacy callback/perform API.
-private final class ContinuationGate<T: Sendable, E: Error>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<T, E>?
-
-    init(continuation: CheckedContinuation<T, E>) {
-        self.continuation = continuation
+    private static func makeRequest() -> VNRecognizeTextRequest {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.revision = VNRecognizeTextRequest.currentRevision
+        request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US", "ja-JP", "ko-KR"]
+        request.usesLanguageCorrection = true
+        request.automaticallyDetectsLanguage = true
+        request.preferBackgroundProcessing = true
+        if #available(macOS 27.0, *) {
+            preferGPUWhenAvailable(for: request)
+        }
+        return request
     }
 
-    func resume(returning value: T) {
-        takeContinuation()?.resume(returning: value)
-    }
+    /// Avoid the macOS 27 E5/ANE cache failure while keeping hardware-accelerated OCR.
+    private static func preferGPUWhenAvailable(for request: VNRecognizeTextRequest) {
+        guard let devicesByStage = try? request.supportedComputeStageDevices else { return }
 
-    func resume(throwing error: E) {
-        takeContinuation()?.resume(throwing: error)
-    }
+        var selectedStages = 0
+        for (stage, devices) in devicesByStage {
+            guard let gpu = devices.first(where: { device in
+                if case .gpu = device { return true }
+                return false
+            }) else { continue }
+            request.setComputeDevice(gpu, for: stage)
+            selectedStages += 1
+        }
 
-    private func takeContinuation() -> CheckedContinuation<T, E>? {
-        lock.lock()
-        defer { lock.unlock() }
-        let continuation = continuation
-        self.continuation = nil
-        return continuation
+        if selectedStages > 0 {
+            AppleOCREngine.logger.info(
+                "Selected GPU compute for \(selectedStages, privacy: .public) Vision stage(s)"
+            )
+        }
     }
 }
 
@@ -211,7 +219,7 @@ private final class RecognitionLease: @unchecked Sendable {
 }
 
 /// Bridges Swift task cancellation to the callback-based Vision request.
-private final class VisionRequestController: @unchecked Sendable {
+final class VisionRequestController: @unchecked Sendable {
     private let lock = NSLock()
     private var request: VNRequest?
     private var isCancelled = false
@@ -232,8 +240,15 @@ private final class VisionRequestController: @unchecked Sendable {
     func cancel() {
         lock.lock()
         isCancelled = true
-        let request = self.request
-        lock.unlock()
         request?.cancel()
+        lock.unlock()
+    }
+
+    /// Stop a late cancellation from reaching the next use of the same request.
+    func finish() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        request = nil
+        return isCancelled
     }
 }
