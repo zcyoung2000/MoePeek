@@ -73,37 +73,48 @@ public enum AppleOCREngine: Sendable {
         automaticallyDetectsLanguage: Bool = true,
         recognitionLevel: VNRequestTextRecognitionLevel = .accurate
     ) async throws -> [RecognizedLine] {
-        try await withCheckedThrowingContinuation { continuation in
-            let continuationGate = ContinuationGate(continuation: continuation)
-            let request = VNRecognizeTextRequest { request, error in
-                if let error {
-                    continuationGate.resume(throwing: RecognitionError.failed(error))
+        let requestController = VisionRequestController()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let continuationGate = ContinuationGate(continuation: continuation)
+                let request = VNRecognizeTextRequest { request, error in
+                    if let error {
+                        continuationGate.resume(throwing: RecognitionError.failed(error))
+                        return
+                    }
+
+                    let observations = (request.results as? [VNRecognizedTextObservation]) ?? []
+                    continuationGate.resume(
+                        returning: observations.compactMap { observation in
+                            guard let candidate = observation.topCandidates(1).first else { return nil }
+                            return RecognizedLine(text: candidate.string)
+                        }
+                    )
+                }
+
+                request.recognitionLevel = recognitionLevel
+                request.revision = 2
+                request.recognitionLanguages = recognitionLanguages
+                request.usesLanguageCorrection = true
+                request.automaticallyDetectsLanguage = automaticallyDetectsLanguage
+                request.preferBackgroundProcessing = true
+
+                if requestController.install(request) {
+                    continuationGate.resume(throwing: CancellationError())
                     return
                 }
 
-                let observations = (request.results as? [VNRecognizedTextObservation]) ?? []
-                continuationGate.resume(
-                    returning: observations.compactMap { observation in
-                        guard let candidate = observation.topCandidates(1).first else { return nil }
-                        return RecognizedLine(text: candidate.string)
+                let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        try handler.perform([request])
+                    } catch {
+                        continuationGate.resume(throwing: RecognitionError.failed(error))
                     }
-                )
-            }
-
-            request.recognitionLevel = recognitionLevel
-            request.revision = 2
-            request.recognitionLanguages = recognitionLanguages
-            request.usesLanguageCorrection = true
-            request.automaticallyDetectsLanguage = automaticallyDetectsLanguage
-
-            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    try handler.perform([request])
-                } catch {
-                    continuationGate.resume(throwing: RecognitionError.failed(error))
                 }
             }
+        } onCancel: {
+            requestController.cancel()
         }
     }
 
@@ -196,5 +207,33 @@ private final class RecognitionLease: @unchecked Sendable {
         released = true
         lock.unlock()
         slot.release()
+    }
+}
+
+/// Bridges Swift task cancellation to the callback-based Vision request.
+private final class VisionRequestController: @unchecked Sendable {
+    private let lock = NSLock()
+    private var request: VNRequest?
+    private var isCancelled = false
+
+    /// Returns whether the request was already cancelled before installation.
+    func install(_ request: VNRequest) -> Bool {
+        lock.lock()
+        self.request = request
+        let wasCancelled = isCancelled
+        lock.unlock()
+
+        if wasCancelled {
+            request.cancel()
+        }
+        return wasCancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        let request = self.request
+        lock.unlock()
+        request?.cancel()
     }
 }

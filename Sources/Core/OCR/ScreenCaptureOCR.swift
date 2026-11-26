@@ -22,11 +22,20 @@ enum ScreenCaptureOCR {
                     continuation.resume(returning: child.terminationStatus)
                 }
                 do {
+                    guard !Task.isCancelled else {
+                        guard gate.claimOnce() else { return }
+                        process.terminationHandler = nil
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
                     try process.run()
+                    if Task.isCancelled {
+                        process.terminate()
+                    }
                 } catch {
                     guard gate.claimOnce() else { return }
                     process.terminationHandler = nil
-                    continuation.resume(throwing: error)
+                    continuation.resume(throwing: Task.isCancelled ? CancellationError() : error)
                 }
             }
         } onCancel: {
