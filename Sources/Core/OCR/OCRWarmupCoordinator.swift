@@ -1,62 +1,48 @@
 import CoreGraphics
 import CoreText
 import Foundation
-import IOKit
-import ImageIO
 import os
 
-/// Best-effort warmup of OS caches. A fresh helper still has to initialize its own Vision runtime.
+/// Warms Vision in MoePeek's long-lived process so real captures reuse that runtime.
 @MainActor
 enum OCRWarmupCoordinator {
     private static let logger = Logger(subsystem: "com.nahida.MoePeek", category: "OCRWarmup")
-    private static let warmupVersion = 3
     private static var warmupTask: Task<Void, Never>?
-
-    private static var warmupStateKey: String {
-        let bootTime = systemBootTime()
-        return "ocrWarmup.v\(warmupVersion).boot.\(bootTime)"
-    }
+    private(set) static var isReady = false
 
     static func warmUpIfNeeded() {
-        let key = warmupStateKey
-        let defaults = UserDefaults.standard
-        guard warmupTask == nil, !defaults.bool(forKey: key) else { return }
+        guard warmupTask == nil, !isReady else { return }
 
         warmupTask = Task(priority: .utility) {
             defer { warmupTask = nil }
             do {
                 let started = Date()
-                let url = try writeWarmupImage()
-                defer { try? FileManager.default.removeItem(at: url) }
-                // Accurate Vision may compile the ANE model for tens of seconds
-                // on macOS 27. Warmup is background work, so let it finish and
-                // populate the system cache before the first user capture.
-                // A successful process exit alone does not mean the model cache
-                // was exercised: Vision can return an empty observation list.
-                // Retry on a later launch rather than suppressing warmup for this boot.
-                let text = try await OCRWorkerClient.recognizeText(
-                    at: url,
-                    timeout: 120,
-                    warmup: true
-                )
+                let image = try makeWarmupImage()
+                let text = try await AppleOCREngine.recognizeText(in: image, timeout: 120)
+                try Task.checkCancellation()
                 guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    logger.warning("OCR warmup returned no text; it will retry on the next launch")
+                    logger.error("OCR warmup returned no text; the engine is not ready")
                     return
                 }
-                defaults.set(true, forKey: key)
-                cleanupOldWarmupKeys(currentKey: key)
+                isReady = true
                 logger.info("OCR warmup completed in \(Date().timeIntervalSince(started), privacy: .public) seconds")
             } catch is CancellationError {
-                // A later app run or real OCR request can warm Vision again.
+                logger.info("OCR warmup was cancelled")
             } catch {
                 logger.error("OCR warmup failed: \(String(describing: error), privacy: .public)")
             }
         }
     }
 
-    private static func writeWarmupImage() throws -> URL {
+    static func requireReady() throws {
+        guard !isReady else { return }
+        warmUpIfNeeded()
+        throw OCRError.engineWarmingUp
+    }
+
+    private static func makeWarmupImage() throws -> CGImage {
         let width = 640
-        let height = 120
+        let height = 240
         guard let context = CGContext(
             data: nil,
             width: width,
@@ -71,54 +57,23 @@ enum OCRWarmupCoordinator {
 
         context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        // Exercise real scripts so warmup also initializes non-Latin recognizers.
+        // Separate script samples to reduce ambiguity for automatic detection.
+        // Nonempty output confirms initialization, not recognition of every script.
         let attributes: [NSAttributedString.Key: Any] = [
             NSAttributedString.Key(kCTFontAttributeName as String):
                 CTFontCreateWithName("Helvetica" as CFString, 28, nil),
             NSAttributedString.Key(kCTForegroundColorAttributeName as String):
                 CGColor(gray: 0, alpha: 1),
         ]
-        for (index, text) in ["MoePeek OCR 123", "文字识别 日本語 한국어"].enumerated() {
+        for (index, text) in ["MoePeek OCR 123", "文字识别测试", "日本語の認識", "한국어 인식"].enumerated() {
             let line = CTLineCreateWithAttributedString(
                 NSAttributedString(string: text, attributes: attributes)
             )
-            context.textPosition = CGPoint(x: 12, y: 76 - index * 48)
+            context.textPosition = CGPoint(x: 12, y: height - 44 - index * 48)
             CTLineDraw(line, context)
         }
 
-        guard let image = context.makeImage() else {
-            throw OCRError.warmupImageCreationFailed
-        }
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("moepeek_ocr_warmup_\(UUID().uuidString).png")
-        guard let destination = CGImageDestinationCreateWithURL(
-            url as CFURL,
-            "public.png" as CFString,
-            1,
-            nil
-        ) else {
-            throw OCRError.warmupImageCreationFailed
-        }
-        CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination) else {
-            try? FileManager.default.removeItem(at: url)
-            throw OCRError.warmupImageCreationFailed
-        }
-        return url
-    }
-
-    private static func systemBootTime() -> String {
-        var mib: [Int32] = [CTL_KERN, KERN_BOOTTIME]
-        var bootTime = timeval()
-        var length = MemoryLayout<timeval>.size
-        let result = sysctl(&mib, 2, &bootTime, &length, nil, 0)
-        return result == 0 ? "\(bootTime.tv_sec)" : "unknown"
-    }
-
-    private static func cleanupOldWarmupKeys(currentKey: String) {
-        let defaults = UserDefaults.standard
-        for key in defaults.dictionaryRepresentation().keys where key.hasPrefix("ocrWarmup.") && key != currentKey {
-            defaults.removeObject(forKey: key)
-        }
+        guard let image = context.makeImage() else { throw OCRError.warmupImageCreationFailed }
+        return image
     }
 }

@@ -5,8 +5,6 @@ final class ProcessContinuationGate: @unchecked Sendable {
     private let lock = NSLock()
     private var resumed = false
 
-    init() {}
-
     func claimOnce() -> Bool {
         lock.lock()
         defer { lock.unlock() }

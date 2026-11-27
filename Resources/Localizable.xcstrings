@@ -1869,6 +1869,46 @@
         }
       }
     },
+    "OCR is still initializing. Please try again shortly." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "OCR 正在初始化，请稍后重试。"
+          }
+        }
+      }
+    },
+    "Text recognition is still in progress" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "上一次 OCR 仍在处理，请稍后重试。"
+          }
+        }
+      }
+    },
+    "Text recognition timed out" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "文字识别超时，请重试。"
+          }
+        }
+      }
+    },
+    "Vision recognition failed: %@" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vision 文字识别失败：%@"
+          }
+        }
+      }
+    },
     "Official" : {
       "extractionState" : "stale",
       "localizations" : {

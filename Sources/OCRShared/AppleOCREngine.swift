@@ -3,248 +3,75 @@ import CoreML
 import os
 @preconcurrency import Vision
 
-/// Accurate OCR for a one-shot worker. The parent owns serialization and the hard deadline.
-/// Do not race a second request against a model load or silently replace CJK with English-only fast OCR.
+/// Accurate OCR hosted in MoePeek's long-lived process so Vision can reuse its initialized models.
 public enum AppleOCREngine: Sendable {
-    private static let logger = Logger(subsystem: "com.nahida.MoePeek", category: "OCR")
-    private static let recoveryRecognitionRevision = 2
+    fileprivate static let logger = Logger(subsystem: "com.nahida.MoePeek", category: "OCR")
+    private static let recognitionSlot = RecognitionSlot()
+    private static let recognizer = VisionTextRecognizer()
 
     public enum RecognitionError: LocalizedError, Sendable {
         case timeout
-        case cpuRecoveryUnavailable
+        case alreadyInProgress
+        case cpuComputeUnavailable
+        case cpuFallbackFailed(primary: any Error, fallback: any Error)
         case failed(any Error)
 
         public var errorDescription: String? {
             switch self {
             case .timeout: String(localized: "Text recognition timed out")
-            case .cpuRecoveryUnavailable: String(localized: "CPU OCR recovery is unavailable")
+            case .alreadyInProgress: String(localized: "Text recognition is still in progress")
+            case .cpuComputeUnavailable: String(localized: "CPU text recognition is unavailable")
+            case .cpuFallbackFailed(let primary, let fallback):
+                String(localized: "Vision recognition failed: \(primary.localizedDescription); CPU fallback failed: \(fallback.localizedDescription)")
             case .failed(let error):
                 String(localized: "Vision recognition failed: \(error.localizedDescription)")
             }
         }
     }
 
-    private static let preferredModernRecognitionLanguages = [
-        Locale.Language(identifier: "zh-Hans"),
-        Locale.Language(identifier: "zh-Hant"),
-        Locale.Language(identifier: "en-US"),
-        Locale.Language(identifier: "ja-JP"),
-        Locale.Language(identifier: "ko-KR"),
-    ]
-
-    /// Match preferred languages to this system's actual modern Vision support.
-    private static let supportedModernRecognitionLanguages: [Locale.Language] = {
-        let request = RecognizeTextRequest()
-        let supported = request.supportedRecognitionLanguages
-        return preferredModernRecognitionLanguages.compactMap { preferred in
-            supported.first { $0.isEquivalent(to: preferred) }
-        }
-    }()
-
     public static func recognizeText(
         in image: CGImage,
-        recoveryMode: Bool = false
+        timeout: TimeInterval = 20
     ) async throws -> String {
-        logger.info(
-            "Starting Apple OCR (\(image.width)x\(image.height) px), recovery: \(recoveryMode, privacy: .public)"
-        )
-        let observations = recoveryMode
-            ? try await performRecoveryVisionOCR(on: image)
-            : try await performVisionOCR(on: image)
+        try Task.checkCancellation()
+        guard recognitionSlot.claim() else {
+            throw RecognitionError.alreadyInProgress
+        }
+        let lease = RecognitionLease(slot: recognitionSlot)
+
+        let started = Date()
+        logger.info("Starting Apple OCR (\(image.width)x\(image.height) px)")
+        let observations: [RecognizedLine]
+        do {
+            observations = try await Task<Never, Never>.withTimeout(seconds: timeout) {
+                guard lease.markStarted() else { throw CancellationError() }
+                defer { lease.release() }
+                return try await performVisionOCR(on: image)
+            }
+            try Task.checkCancellation()
+        } catch is TaskTimeoutError {
+            lease.releaseIfNotStarted()
+            logger.error("Apple OCR timed out after \(timeout, privacy: .public) seconds")
+            throw RecognitionError.timeout
+        } catch is CancellationError {
+            lease.releaseIfNotStarted()
+            logger.info("Apple OCR was cancelled")
+            throw CancellationError()
+        } catch {
+            lease.releaseIfNotStarted()
+            logger.error("Apple OCR failed after \(Date().timeIntervalSince(started), privacy: .public) seconds: \(String(describing: error), privacy: .public)")
+            throw error
+        }
         let text = observations
             .map(\.text)
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .joined(separator: "\n")
-        logger.info("Apple OCR finished with \(observations.count, privacy: .public) observations")
+        logger.info("Apple OCR finished in \(Date().timeIntervalSince(started), privacy: .public) seconds with \(observations.count, privacy: .public) observations")
         return text
     }
 
     private static func performVisionOCR(on cgImage: CGImage) async throws -> [RecognizedLine] {
-        if #available(macOS 26.0, *) {
-            do {
-                return try await performModernVisionOCR(on: cgImage, recognitionLevel: .accurate)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                // On macOS 27, falling through to another accurate request can
-                // pay the same ANE compilation cost a second time. The caller
-                // owns the fast recovery policy and can bound this attempt.
-                logger.error("Modern Vision OCR failed: \(String(describing: error), privacy: .public)")
-                throw error
-            }
-        }
-        return try await performLegacyVisionOCR(on: cgImage)
-    }
-
-    /// Compatibility path for the macOS 27 accurate-model regression.
-    /// Revision 2 supports Chinese and Western languages and is explicitly pinned
-    /// to CPU so a cold ANE model compile cannot stall the recovery request too.
-    private static func performRecoveryVisionOCR(on cgImage: CGImage) async throws -> [RecognizedLine] {
-        let accurateRequest = VNRecognizeTextRequest()
-        accurateRequest.revision = recoveryRecognitionRevision
-        accurateRequest.recognitionLevel = .accurate
-        let accurateSupported = (try? accurateRequest.supportedRecognitionLanguages()) ?? []
-        let accurateLanguages = ["zh-Hans", "zh-Hant", "en-US"].filter(accurateSupported.contains)
-
-        logger.info(
-            "Running OCR recovery with Vision revision 2, languages: \(accurateLanguages, privacy: .public)"
-        )
-        do {
-            let accurateObservations = try await performSingleLegacyVisionOCR(
-                on: cgImage,
-                recognitionLanguages: accurateLanguages,
-                automaticallyDetectsLanguage: false,
-                recognitionLevel: .accurate,
-                revision: recoveryRecognitionRevision,
-                computeOnCPU: true
-            )
-            if !accurateObservations.isEmpty { return accurateObservations }
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            logger.error("Vision revision 2 recovery failed: \(String(describing: error), privacy: .public)")
-            throw error
-        }
-        return []
-    }
-
-    // MARK: - Legacy API
-
-    private static func performLegacyVisionOCR(on cgImage: CGImage) async throws -> [RecognizedLine] {
-        let observations = try await performSingleLegacyVisionOCR(on: cgImage)
-
-        // Easydict found Japanese samples that auto language detection misses entirely.
-        if observations.isEmpty {
-            return try await performSingleLegacyVisionOCR(
-                on: cgImage,
-                recognitionLanguages: ["ja-JP"],
-                automaticallyDetectsLanguage: false
-            )
-        }
-        return observations
-    }
-
-    private static func performSingleLegacyVisionOCR(
-        on cgImage: CGImage,
-        recognitionLanguages: [String] = ["zh-Hans", "zh-Hant", "en-US", "ja-JP", "ko-KR"],
-        automaticallyDetectsLanguage: Bool = true,
-        recognitionLevel: VNRequestTextRecognitionLevel = .accurate,
-        revision: Int? = nil,
-        computeOnCPU: Bool = false
-    ) async throws -> [RecognizedLine] {
-        try await withCheckedThrowingContinuation { continuation in
-            let continuationGate = ContinuationGate(continuation: continuation)
-            let request = VNRecognizeTextRequest { request, error in
-                if let error {
-                    continuationGate.resume(throwing: RecognitionError.failed(error))
-                    return
-                }
-
-                let observations = (request.results as? [VNRecognizedTextObservation]) ?? []
-                continuationGate.resume(
-                    returning: observations.compactMap { observation in
-                        guard let candidate = observation.topCandidates(1).first else { return nil }
-                        return RecognizedLine(text: candidate.string)
-                    }
-                )
-            }
-
-            request.recognitionLevel = recognitionLevel
-            if let revision { request.revision = revision }
-            request.recognitionLanguages = recognitionLanguages
-            request.usesLanguageCorrection = true
-            request.automaticallyDetectsLanguage = automaticallyDetectsLanguage
-
-            if computeOnCPU {
-                do {
-                    let supportedStages = try request.supportedComputeStageDevices
-                    let cpuDevicesByStage = supportedStages.compactMapValues { devices in
-                        devices.first { device in
-                            if case .cpu = device { return true }
-                            return false
-                        }
-                    }
-                    guard cpuDevicesByStage.count == supportedStages.count else {
-                        continuationGate.resume(throwing: RecognitionError.cpuRecoveryUnavailable)
-                        return
-                    }
-                    for (stage, cpuDevice) in cpuDevicesByStage {
-                        request.setComputeDevice(cpuDevice, for: stage)
-                    }
-                    logger.info("Pinned compatibility OCR compute stages to CPU to bypass ANE compilation")
-                } catch {
-                    continuationGate.resume(throwing: RecognitionError.failed(error))
-                    return
-                }
-            }
-
-            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    try handler.perform([request])
-                } catch {
-                    continuationGate.resume(throwing: RecognitionError.failed(error))
-                }
-            }
-        }
-    }
-
-    // MARK: - Modern API
-
-    @available(macOS 26.0, *)
-    private static func performModernVisionOCR(
-        on cgImage: CGImage,
-        recognitionLevel: RecognizeTextRequest.RecognitionLevel
-    ) async throws -> [RecognizedLine] {
-        let observations = try await performSingleModernVisionOCR(
-            on: cgImage,
-            recognitionLanguages: Self.supportedModernRecognitionLanguages,
-            automaticallyDetectsLanguage: true,
-            recognitionLevel: recognitionLevel
-        )
-
-        guard observations.isEmpty, recognitionLevel == .accurate else { return observations }
-
-        // Easydict found Japanese samples that automatic language detection misses entirely.
-        logger.info("No text recognized with automatic languages; retrying with Japanese")
-        return try await performSingleModernVisionOCR(
-            on: cgImage,
-            recognitionLanguages: [.init(identifier: "ja-JP")],
-            automaticallyDetectsLanguage: false,
-            recognitionLevel: recognitionLevel
-        )
-    }
-
-    private static func performSingleModernVisionOCR(
-        on cgImage: CGImage,
-        recognitionLanguages: [Locale.Language],
-        automaticallyDetectsLanguage: Bool,
-        recognitionLevel: RecognizeTextRequest.RecognitionLevel
-    ) async throws -> [RecognizedLine] {
-        var request = RecognizeTextRequest()
-        request.recognitionLevel = recognitionLevel
-        let supportedLanguages = request.supportedRecognitionLanguages
-        request.recognitionLanguages = recognitionLanguages.compactMap { preferred in
-            supportedLanguages.first { supported in
-                supported.isEquivalent(to: preferred)
-            }
-        }
-        request.usesLanguageCorrection = recognitionLevel == .accurate
-        request.automaticallyDetectsLanguage = automaticallyDetectsLanguage
-
-        logger.info(
-            "Performing modern Vision OCR with level: \(recognitionLevel == .fast ? "fast" : "accurate", privacy: .public), languages: \(request.recognitionLanguages.map(\.minimalIdentifier), privacy: .public), auto detect: \(request.automaticallyDetectsLanguage, privacy: .public)"
-        )
-
-        do {
-            let observations = try await request.perform(on: cgImage)
-            return observations.compactMap { observation in
-                guard let candidate = observation.topCandidates(1).first else { return nil }
-                return RecognizedLine(text: candidate.string)
-            }
-        } catch {
-            throw RecognitionError.failed(error)
-        }
+        try await recognizer.recognize(cgImage)
     }
 }
 
@@ -252,28 +79,297 @@ private struct RecognizedLine: Sendable {
     let text: String
 }
 
-/// Race-safe one-shot continuation wrapper for the legacy callback/perform API.
-private final class ContinuationGate<T: Sendable, E: Error>: @unchecked Sendable {
+/// The queue owns the request and the processing session that keeps its models alive.
+final class VisionTextRecognizer: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.nahida.MoePeek.OCR", qos: .userInitiated)
+    private var handler = VNSequenceRequestHandler()
+    private var request: VNRecognizeTextRequest?
+    private var prefersCPUAfterFailure = false
+
+    fileprivate func recognize(_ image: CGImage) async throws -> [RecognizedLine] {
+        try Task.checkCancellation()
+        let requestController = VisionRequestController()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                queue.async {
+                    guard !requestController.cancellationRequested else {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+                    do {
+                        let request = try self.request ?? self.makeNextRequest()
+                        self.request = request
+                        guard !requestController.install(request) else {
+                            self.request = nil
+                            continuation.resume(throwing: CancellationError())
+                            return
+                        }
+                        let completedRequest = try self.perform(
+                            request,
+                            on: image,
+                            controller: requestController
+                        )
+
+                        // Resume only after perform has returned so the recognition
+                        // slot stays occupied until Vision has fully unwound.
+                        // Detach cancellation before this request can be reused.
+                        guard !requestController.finish() else {
+                            self.request = nil
+                            continuation.resume(throwing: CancellationError())
+                            return
+                        }
+                        let lines: [RecognizedLine] = (completedRequest.results ?? []).compactMap { observation in
+                            guard let candidate = observation.topCandidates(1).first else { return nil }
+                            return RecognizedLine(text: candidate.string)
+                        }
+                        continuation.resume(returning: lines)
+                    } catch {
+                        // Cancelled and failed requests must not become the next
+                        // capture's warmed request.
+                        self.request = nil
+                        let wasCancelled = requestController.finish()
+                        if !wasCancelled {
+                            self.handler = VNSequenceRequestHandler()
+                        }
+                        if wasCancelled || error is CancellationError {
+                            continuation.resume(throwing: CancellationError())
+                        } else if let recognitionError = error as? AppleOCREngine.RecognitionError {
+                            continuation.resume(throwing: recognitionError)
+                        } else {
+                            continuation.resume(throwing: AppleOCREngine.RecognitionError.failed(error))
+                        }
+                    }
+                }
+            }
+        } onCancel: {
+            requestController.cancel()
+        }
+    }
+
+    private func makeNextRequest() throws -> VNRecognizeTextRequest {
+        if prefersCPUAfterFailure, #available(macOS 27.0, *) {
+            AppleOCREngine.logger.info("Using CPU after an accelerated Vision OCR failure")
+            return try Self.makeCPURequest()
+        }
+        let request = Self.makeBaseRequest()
+        if #available(macOS 27.0, *) {
+            Self.preferGPUWhenAvailable(for: request)
+        }
+        return request
+    }
+
+    private func perform(
+        _ request: VNRecognizeTextRequest,
+        on image: CGImage,
+        controller: VisionRequestController
+    ) throws -> VNRecognizeTextRequest {
+        guard #available(macOS 27.0, *), !prefersCPUAfterFailure else {
+            try handler.perform([request], on: image)
+            return request
+        }
+
+        return try VisionCPUFallback.run(
+            isCancelled: { controller.cancellationRequested },
+            accelerated: {
+                try self.handler.perform([request], on: image)
+                return request
+            },
+            cpuFallback: {
+                let cpuRequest = try Self.makeCPURequest()
+                self.handler = VNSequenceRequestHandler()
+                guard !controller.install(cpuRequest) else { throw CancellationError() }
+                self.request = cpuRequest
+                try self.handler.perform([cpuRequest], on: image)
+                self.prefersCPUAfterFailure = true
+                AppleOCREngine.logger.info("Apple OCR CPU fallback succeeded")
+                return cpuRequest
+            }
+        )
+    }
+
+    private static func makeBaseRequest() -> VNRecognizeTextRequest {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.revision = VNRecognizeTextRequest.currentRevision
+        request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US", "ja-JP", "ko-KR"]
+        request.usesLanguageCorrection = true
+        request.automaticallyDetectsLanguage = true
+        request.preferBackgroundProcessing = true
+        return request
+    }
+
+    @available(macOS 27.0, *)
+    static func makeCPURequest() throws -> VNRecognizeTextRequest {
+        let request = makeBaseRequest()
+        let devicesByStage = try request.supportedComputeStageDevices
+        guard !devicesByStage.isEmpty else {
+            throw AppleOCREngine.RecognitionError.cpuComputeUnavailable
+        }
+
+        for (stage, devices) in devicesByStage {
+            guard let cpu = devices.first(where: { device in
+                if case .cpu = device { return true }
+                return false
+            }) else {
+                throw AppleOCREngine.RecognitionError.cpuComputeUnavailable
+            }
+            request.setComputeDevice(cpu, for: stage)
+        }
+
+        AppleOCREngine.logger.info(
+            "Selected CPU compute for all \(devicesByStage.count, privacy: .public) Vision stage(s)"
+        )
+        return request
+    }
+
+    private static func preferGPUWhenAvailable(for request: VNRecognizeTextRequest) {
+        guard let devicesByStage = try? request.supportedComputeStageDevices else { return }
+
+        var selectedStages = 0
+        for (stage, devices) in devicesByStage {
+            guard let gpu = devices.first(where: { device in
+                if case .gpu = device { return true }
+                return false
+            }) else { continue }
+            request.setComputeDevice(gpu, for: stage)
+            selectedStages += 1
+        }
+
+        if selectedStages > 0 {
+            AppleOCREngine.logger.info(
+                "Selected GPU compute for \(selectedStages, privacy: .public) Vision stage(s)"
+            )
+        }
+    }
+}
+
+enum VisionCPUFallback {
+    static func run<T>(
+        isCancelled: () -> Bool,
+        accelerated: () throws -> T,
+        cpuFallback: () throws -> T
+    ) throws -> T {
+        do {
+            return try accelerated()
+        } catch {
+            guard !(error is CancellationError), !isCancelled() else { throw CancellationError() }
+            let primaryError = error
+            AppleOCREngine.logger.error(
+                "Accelerated Vision OCR failed; retrying on CPU: \(String(describing: primaryError), privacy: .public)"
+            )
+            do {
+                return try cpuFallback()
+            } catch {
+                guard !(error is CancellationError), !isCancelled() else { throw CancellationError() }
+                throw AppleOCREngine.RecognitionError.cpuFallbackFailed(
+                    primary: primaryError,
+                    fallback: error
+                )
+            }
+        }
+    }
+}
+
+final class RecognitionSlot: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<T, E>?
+    private var isClaimed = false
 
-    init(continuation: CheckedContinuation<T, E>) {
-        self.continuation = continuation
-    }
-
-    func resume(returning value: T) {
-        takeContinuation()?.resume(returning: value)
-    }
-
-    func resume(throwing error: E) {
-        takeContinuation()?.resume(throwing: error)
-    }
-
-    private func takeContinuation() -> CheckedContinuation<T, E>? {
+    func claim() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        let continuation = continuation
-        self.continuation = nil
-        return continuation
+        guard !isClaimed else { return false }
+        isClaimed = true
+        return true
+    }
+
+    func release() {
+        lock.lock()
+        isClaimed = false
+        lock.unlock()
+    }
+}
+
+final class RecognitionLease: @unchecked Sendable {
+    private let lock = NSLock()
+    private let slot: RecognitionSlot
+    private var started = false
+    private var released = false
+
+    init(slot: RecognitionSlot) {
+        self.slot = slot
+    }
+
+    func markStarted() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !released else { return false }
+        started = true
+        return true
+    }
+
+    func releaseIfNotStarted() {
+        lock.lock()
+        guard !started, !released else {
+            lock.unlock()
+            return
+        }
+        released = true
+        lock.unlock()
+        slot.release()
+    }
+
+    func release() {
+        lock.lock()
+        guard !released else {
+            lock.unlock()
+            return
+        }
+        released = true
+        lock.unlock()
+        slot.release()
+    }
+}
+
+/// Bridges Swift task cancellation to synchronous Vision execution.
+final class VisionRequestController: @unchecked Sendable {
+    private let lock = NSLock()
+    private var request: VNRequest?
+    private var isCancelled = false
+
+    var cancellationRequested: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isCancelled
+    }
+
+    /// Returns whether the request was already cancelled before installation.
+    func install(_ request: VNRequest) -> Bool {
+        lock.lock()
+        self.request = request
+        let wasCancelled = isCancelled
+        lock.unlock()
+
+        if wasCancelled {
+            request.cancel()
+        }
+        return wasCancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        let request = self.request
+        lock.unlock()
+        // finish() observes isCancelled before the caller can reuse this request.
+        // Do not call into Vision while holding our own lock.
+        request?.cancel()
+    }
+
+    /// Stop a late cancellation from reaching the next use of the same request.
+    func finish() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        request = nil
+        return isCancelled
     }
 }
