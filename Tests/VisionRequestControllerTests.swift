@@ -38,11 +38,33 @@ struct VisionRequestControllerTests {
         #expect(request.cancellationCount == 0)
         #expect(!nextCapture.finish())
     }
+
+    @Test func cancellationCanFinishWithoutReenteringTheControllerLock() {
+        let controller = VisionRequestController()
+        let request = RecordingVisionRequest(onCancel: {
+            // Exercise synchronous reentry without holding the controller lock.
+            // finish() must observe cancellation and prevent request reuse.
+            #expect(controller.finish())
+        })
+        #expect(!controller.install(request))
+
+        controller.cancel()
+
+        #expect(request.cancellationCount == 1)
+        controller.cancel()
+        #expect(request.cancellationCount == 1)
+    }
 }
 
 private final class RecordingVisionRequest: VNRequest, @unchecked Sendable {
     private let lock = NSLock()
     private var cancellations = 0
+    private let onCancel: @Sendable () -> Void
+
+    init(onCancel: @escaping @Sendable () -> Void = {}) {
+        self.onCancel = onCancel
+        super.init(completionHandler: nil)
+    }
 
     var cancellationCount: Int {
         lock.lock()
@@ -54,5 +76,6 @@ private final class RecordingVisionRequest: VNRequest, @unchecked Sendable {
         lock.lock()
         cancellations += 1
         lock.unlock()
+        onCancel()
     }
 }

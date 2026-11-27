@@ -4,6 +4,7 @@ import ImageIO
 enum ScreenCaptureOCR {
     /// Capture a screen region, then run one accurate Vision request in the app process.
     static func captureAndRecognize() async throws -> String {
+        try Task.checkCancellation()
         try await OCRWarmupCoordinator.requireReady()
 
         let imageURL = FileManager.default.temporaryDirectory
@@ -14,35 +15,7 @@ enum ScreenCaptureOCR {
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
         process.arguments = ["-i", imageURL.path]
 
-        let status = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int32, Error>) in
-                let gate = ProcessContinuationGate()
-                process.terminationHandler = { child in
-                    guard gate.claimOnce() else { return }
-                    continuation.resume(returning: child.terminationStatus)
-                }
-                do {
-                    guard !Task.isCancelled else {
-                        guard gate.claimOnce() else { return }
-                        process.terminationHandler = nil
-                        continuation.resume(throwing: CancellationError())
-                        return
-                    }
-                    try process.run()
-                    if Task.isCancelled {
-                        process.terminate()
-                    }
-                } catch {
-                    guard gate.claimOnce() else { return }
-                    process.terminationHandler = nil
-                    continuation.resume(throwing: Task.isCancelled ? CancellationError() : error)
-                }
-            }
-        } onCancel: {
-            process.terminate()
-        }
-
-        guard !Task.isCancelled else { throw CancellationError() }
+        let status = try await runCaptureProcess(process)
         guard status == 0, FileManager.default.fileExists(atPath: imageURL.path) else {
             throw OCRError.captureCancelled
         }
@@ -56,8 +29,53 @@ enum ScreenCaptureOCR {
         }
     }
 
+    /// Wait for the child to exit before releasing its capture file, even on cancellation.
+    static func runCaptureProcess(
+        _ process: Process,
+        launch: @Sendable (Process) throws -> Void = { try $0.run() }
+    ) async throws -> Int32 {
+        try Task.checkCancellation()
+        let status = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int32, Error>) in
+                let gate = ProcessContinuationGate()
+                process.terminationHandler = { child in
+                    guard gate.claimOnce() else { return }
+                    child.terminationHandler = nil
+                    continuation.resume(returning: child.terminationStatus)
+                }
+                do {
+                    guard !Task.isCancelled else {
+                        guard gate.claimOnce() else { return }
+                        process.terminationHandler = nil
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+                    try launch(process)
+                    if Task.isCancelled, process.isRunning {
+                        process.terminate()
+                    }
+                } catch {
+                    guard gate.claimOnce() else { return }
+                    process.terminationHandler = nil
+                    continuation.resume(throwing: Task.isCancelled ? CancellationError() : error)
+                }
+            }
+        } onCancel: {
+            // terminate() raises an Objective-C exception before the first run().
+            // A cancellation during launch is handled by the check after run().
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+
+        try Task.checkCancellation()
+        return status
+    }
+
     static func recognize(accurate: () async throws -> String) async throws -> String {
+        try Task.checkCancellation()
         let text = try await accurate()
+        try Task.checkCancellation()
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw OCRError.noTextRecognized
         }

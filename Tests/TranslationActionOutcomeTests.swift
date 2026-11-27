@@ -146,30 +146,18 @@ import Testing
         #expect(coordinator.providerStates == newProviderStates)
     }
 
-    @Test func staleOCRCancellationDoesNotRestoreOverNewInputSession() async {
-        var finishOCR: CheckedContinuation<String, Error>?
+    @Test func staleOCRCancellationDoesNotRestoreOverNewInputSession() async throws {
+        let capture = SuspendedOCRCapture()
         let coordinator = makeCoordinator(
-            captureOCR: {
-                try await withCheckedThrowingContinuation { continuation in
-                    finishOCR = continuation
-                }
-                return "unreachable"
-            }
+            captureOCR: { try await capture.capture() }
         )
 
         let staleTask = Task { @MainActor in
             await coordinator.ocrAndTranslate()
         }
 
-        for _ in 0 ..< 100 where finishOCR == nil {
-            await Task.yield()
-        }
-        guard let finishOCR else {
-            Issue.record("OCR capture did not reach its continuation")
-            staleTask.cancel()
-            _ = await staleTask.value
-            return
-        }
+        var started = capture.started.makeAsyncIterator()
+        let finishOCR = try #require(await started.next())
 
         coordinator.prepareInputMode()
         coordinator.translate("new translation")
@@ -187,6 +175,55 @@ import Testing
         expectActive(coordinator)
         #expect(coordinator.sourceText == newSourceText)
         #expect(coordinator.providerStates == newProviderStates)
+    }
+
+    enum OCRAction: CaseIterable, Sendable {
+        case translate
+        case clipboard
+    }
+
+    @Test(arguments: OCRAction.allCases)
+    func cancelledOCRDoesNotReportALateOrdinaryError(_ action: OCRAction) async throws {
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        pasteboard.setString("sentinel", forType: .string)
+        let capture = SuspendedOCRCapture()
+        let coordinator = makeCoordinator(
+            captureOCR: { try await capture.capture() }, ocrPasteboard: pasteboard
+        )
+        coordinator.translate("existing source")
+        let task = Task {
+            switch action {
+            case .translate: return await coordinator.ocrAndTranslate() == .preserve
+            case .clipboard: return await coordinator.ocrToClipboard() == .cancelled
+            }
+        }
+        var started = capture.started.makeAsyncIterator()
+        let finish = try #require(await started.next())
+
+        task.cancel()
+        finish.resume(throwing: OCRError.captureReadFailed)
+
+        #expect(await task.value)
+        #expect(coordinator.globalError == nil)
+        #expect(coordinator.sourceText == "existing source")
+        #expect(pasteboard.string(forType: .string) == "sentinel")
+    }
+
+    @Test(arguments: OCRAction.allCases)
+    func alreadyCancelledOCRDoesNotShowAPermissionError(_ action: OCRAction) async {
+        let coordinator = makeCoordinator(screenRecordingGranted: false)
+        let task = Task {
+            switch action {
+            case .translate: return await coordinator.ocrAndTranslate() == .preserve
+            case .clipboard: return await coordinator.ocrToClipboard() == .cancelled
+            }
+        }
+        task.cancel()
+
+        #expect(await task.value)
+        expectIdle(coordinator)
+        #expect(coordinator.globalError == nil)
     }
 
     @Test func overlappingEmptyCapturesKeepIdleState() async {
@@ -324,13 +361,14 @@ import Testing
         while finishRestoration == nil { await Task.yield() }
         captureTask.cancel()
 
-        var captureFinished = false
+        let captureFinished = AsyncStream<Void>.makeStream()
         let coordinator = makeCoordinator(captureOCR: {
-            captureFinished = true
+            captureFinished.continuation.yield(())
+            captureFinished.continuation.finish()
             return "recognized text"
         }, ocrPasteboard: pasteboard)
         let ocrTask = Task { await coordinator.ocrToClipboard() }
-        while !captureFinished { await Task.yield() }
+        for await _ in captureFinished.stream { break }
 
         switch interruption {
         case .none:
@@ -424,9 +462,8 @@ import Testing
     }
 
     @Test func ocrRunsOutsideMainActorSoVisionCannotBlockUI() async {
-        var ranOutsideMainActor = false
         let coordinator = makeCoordinator(captureOCR: {
-            ranOutsideMainActor = !Thread.isMainThread
+            #expect(!isRunningOnMainThread())
             return "background recognized text"
         })
 
@@ -434,7 +471,31 @@ import Testing
 
         #expect(outcome == .present)
         #expect(coordinator.sourceText == "background recognized text")
-        #expect(ranOutsideMainActor)
+    }
+}
+
+private func isRunningOnMainThread() -> Bool {
+    Thread.isMainThread
+}
+
+private struct SuspendedOCRCapture: Sendable {
+    let started: AsyncStream<CheckedContinuation<String, Error>>
+    private let continuation: AsyncStream<CheckedContinuation<String, Error>>.Continuation
+
+    init() {
+        let stream = AsyncStream<CheckedContinuation<String, Error>>.makeStream()
+        started = stream.stream
+        continuation = stream.continuation
+    }
+
+    func capture() async throws -> String {
+        try await withCheckedThrowingContinuation { capture in
+            if case .terminated = continuation.yield(capture) {
+                Issue.record("The test capture was unexpectedly invoked more than once")
+                capture.resume(throwing: CancellationError())
+            }
+            continuation.finish()
+        }
     }
 }
 

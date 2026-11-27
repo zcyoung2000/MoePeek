@@ -4,7 +4,7 @@ import Foundation
 import Testing
 @testable import MoePeek
 
-@Suite(.timeLimit(.minutes(3)))
+@Suite(.timeLimit(.minutes(5)))
 struct AppleOCREngineTests {
     @Test @MainActor func accurateVisionReusesTheWarmedProcess() async throws {
         OCRWarmupCoordinator.warmUpIfNeeded()
@@ -16,18 +16,27 @@ struct AppleOCREngineTests {
 
         // Change both image size and content to catch stale model resources and
         // accidentally returning the preceding request's observations.
-        for (width, height, marker, script) in [
-            (530, 112, "123", "文字识别测试"),
-            (1718, 204, "456", "文字识别测试"),
-            (960, 240, "789", "日本語の認識"),
-            (960, 240, "852", "한국어 인식"),
-            (530, 112, "123", "文字识别测试"),
+        // A mixed-script warmup does not guarantee that Vision loads Korean.
+        // Budget its first use for cold initialization, then check warmed reuse
+        // with the same 20-second limit as other captures.
+        for (width, height, marker, script, timeout) in [
+            (140, 66, "234", "文字识别测试", 20.0),
+            (530, 112, "123", "文字识别测试", 20.0),
+            (1718, 204, "456", "文字识别测试", 20.0),
+            (960, 240, "789", "日本語の認識", 20.0),
+            (960, 240, "852", "한국어 인식", 120.0),
+            (960, 240, "963", "한국어 인식", 20.0),
+            (530, 112, "123", "文字识别测试", 20.0),
         ] {
             let image = try makeMixedLanguageImage(width: width, height: height, marker: marker, script: script)
-            let text = try await AppleOCREngine.recognizeText(in: image, timeout: 20)
-            #expect(text.contains("Hello"))
-            #expect(text.contains(marker))
-            #expect(text.contains(script))
+            let text = try await AppleOCREngine.recognizeText(in: image, timeout: timeout)
+            if width < 300 {
+                #expect(text.contains(marker))
+            } else {
+                #expect(text.contains("Hello"))
+                #expect(text.contains(marker))
+                #expect(text.contains(script))
+            }
         }
     }
 
@@ -46,10 +55,9 @@ struct AppleOCREngineTests {
 
         context.setFillColor(CGColor(gray: 1, alpha: 1))
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        // Vision scales wide inputs for detection; keep their text legible at
-        // that scale instead of testing a tiny, language-corrected acronym.
-        let fontSize: CGFloat = width >= 1500 ? 44 : 28
-        let lineSpacing = width >= 1500 ? 64 : 44
+        // Keep sample text legible across the different image sizes.
+        let fontSize: CGFloat = width < 300 ? 12 : (width >= 1500 ? 44 : 28)
+        let lineSpacing = width < 300 ? 20 : (width >= 1500 ? 64 : 44)
         let lines = ["Hello world \(marker)", script]
         for (index, text) in lines.enumerated() {
             let fontName = index == 0 ? "Helvetica" : "PingFangSC-Regular"

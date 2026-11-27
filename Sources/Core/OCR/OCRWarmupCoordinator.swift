@@ -19,6 +19,7 @@ enum OCRWarmupCoordinator {
                 let started = Date()
                 let image = try makeWarmupImage()
                 let text = try await AppleOCREngine.recognizeText(in: image, timeout: 120)
+                try Task.checkCancellation()
                 guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     logger.error("OCR warmup returned no text; the engine is not ready")
                     return
@@ -56,8 +57,8 @@ enum OCRWarmupCoordinator {
 
         context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        // Keep scripts on separate lines so automatic detection exercises each
-        // recognizer instead of classifying a mixed CJK line as just one script.
+        // Separate script samples to reduce ambiguity for automatic detection.
+        // Nonempty output confirms initialization, not recognition of every script.
         let attributes: [NSAttributedString.Key: Any] = [
             NSAttributedString.Key(kCTFontAttributeName as String):
                 CTFontCreateWithName("Helvetica" as CFString, 28, nil),

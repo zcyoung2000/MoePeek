@@ -71,7 +71,7 @@ final class TranslationCoordinator {
         permissionManager: any PermissionChecking,
         registry: TranslationProviderRegistry,
         grabSelection: @escaping @MainActor () async -> RichSourceDocument? = TextSelectionManager.grabSelectedDocument,
-        captureOCR: @escaping @Sendable () async throws -> String = ScreenCaptureOCR.captureAndRecognize,
+        captureOCR: @escaping @Sendable () async throws -> String = { try await ScreenCaptureOCR.captureAndRecognize() },
         resolveSmart: @escaping @MainActor () async -> SmartTranslationResult = { await SmartTranslationResolver.resolve() },
         ocrPasteboard: NSPasteboard = .general
     ) {
@@ -142,6 +142,7 @@ final class TranslationCoordinator {
     /// Triggered by OCR shortcut: screen capture → OCR → translate.
     @discardableResult
     func ocrAndTranslate() async -> ActionOutcome {
+        guard !Task.isCancelled else { return .preserve }
         let requestToken = beginAction()
         guard permissionManager.isScreenRecordingGranted else {
             phase = .active
@@ -162,7 +163,7 @@ final class TranslationCoordinator {
         } catch is CancellationError {
             return .preserve
         } catch {
-            guard requestToken == actionToken else { return .preserve }
+            guard !Task.isCancelled, requestToken == actionToken else { return .preserve }
             phase = .active
             sourceText = ""
             globalError = String(localized: "OCR failed: \(error.localizedDescription)")
@@ -181,6 +182,7 @@ final class TranslationCoordinator {
     /// The caller presents both success and failure as a transient toast.
     @discardableResult
     func ocrToClipboard() async -> SilentOCROutcome {
+        guard !Task.isCancelled else { return .cancelled }
         let requestToken = beginAction()
         guard permissionManager.isScreenRecordingGranted else {
             return .failed(
@@ -207,7 +209,7 @@ final class TranslationCoordinator {
         } catch is CancellationError {
             return .cancelled
         } catch {
-            guard requestToken == actionToken else { return .cancelled }
+            guard !Task.isCancelled, requestToken == actionToken else { return .cancelled }
             return .failed(message: String(localized: "OCR failed: \(error.localizedDescription)"))
         }
     }

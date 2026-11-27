@@ -49,7 +49,12 @@ private final class TimeoutRace<Value: Sendable>: @unchecked Sendable {
         }
         timeoutTask = Task {
             do {
-                try await Task.sleep(for: .milliseconds(Int(seconds * 1_000)))
+                // Bound before multiplying: a finite TimeInterval can still
+                // overflow an integer conversion. Preserve submillisecond input.
+                let nanoseconds: UInt64 = seconds >= TimeInterval(UInt64.max / 1_000_000_000)
+                    ? .max
+                    : UInt64(max(1, seconds * 1_000_000_000))
+                try await Task.sleep(for: .nanoseconds(nanoseconds))
                 self.finish(.failure(TaskTimeoutError()))
             } catch {
                 // The operation completed or the caller cancelled first.
